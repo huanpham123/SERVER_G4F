@@ -1,174 +1,259 @@
+from flask import Flask, request, jsonify, render_template
+from flask_cors import CORS
 import os
 import json
-import requests
-import pytz
-import logging
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from flask import Flask, request, jsonify, Response, render_template
-from flask_cors import CORS
+from functools import wraps
+import logging
+import pytz
+import requests
 
-# --- Cấu hình logging để dễ dàng debug trên Vercel ---
-logging.basicConfig(level=logging.INFO)
-
-# --- Lazy import g4f để Vercel build không bị lỗi ---
-try:
-    from g4f.client import Client
-    # Chọn một vài provider được đánh giá là ổn định hơn
-    from g4f.Provider import (
-        Liaobots,
-        GeekGpt,
-        AiChatOnline,
-    )
-    G4F_AVAILABLE = True
-except ImportError as e:
-    logging.error(f"g4f import error: {e}")
-    G4F_AVAILABLE = False
-
-# --- Cấu hình ứng dụng ---
-# Lấy cấu hình từ biến môi trường của Vercel
+# Config
 VIETNAM_TZ = pytz.timezone(os.getenv("VIETNAM_TZ", "Asia/Ho_Chi_Minh"))
+MAX_MESSAGES = int(os.getenv("MAX_MESSAGES", 80))
+MAX_INPUT_MESSAGES = int(os.getenv("MAX_INPUT_MESSAGES", 3))
 MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o-mini")
-API_CALL_TIMEOUT = int(os.getenv("API_CALL_TIMEOUT", 30)) # Tăng timeout lên một chút
-MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", 20))
-MAX_PAYLOAD_MESSAGES = int(os.getenv("MAX_PAYLOAD_MESSAGES", 7)) # Gửi nhiều ngữ cảnh hơn một chút
+API_CALL_TIMEOUT = float(os.getenv("API_CALL_TIMEOUT", 15.0))
 
-# URL API để lưu trữ lịch sử chat (BẮT BUỘC)
-STORAGE_API_URL = os.getenv("STORAGE_API_URL")
-STORAGE_API_KEY = os.getenv("STORAGE_API_KEY")
+# Thread pool for async background tasks
+executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="chatbot")
 
-# --- MỚI: Cho phép chọn Provider qua biến môi trường ---
-# Bạn có thể đặt G4F_PROVIDER trên Vercel là "GeekGpt", "Liaobots", etc.
-# Nếu không đặt, nó sẽ thử Liaobots trước.
-DEFAULT_PROVIDER = Liaobots
-PROVIDER_MAP = {
-    "Liaobots": Liaobots,
-    "GeekGpt": GeekGpt,
-    "AiChatOnline": AiChatOnline,
-}
-SELECTED_PROVIDER_NAME = os.getenv("G4F_PROVIDER", "Liaobots")
-G4F_PROVIDER = PROVIDER_MAP.get(SELECTED_PROVIDER_NAME, DEFAULT_PROVIDER)
+# Logging
+logging.basicConfig(level=logging.WARNING, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger("ultrafast")
+logger.setLevel(logging.WARNING)
 
-
-# --- Khởi tạo Flask App ---
+# Flask app
 app = Flask(__name__, template_folder="templates")
 CORS(app, resources={r"/api/*": {"origins": "*"}})
+app.logger.disabled = True
 
-# Khởi tạo g4f client (nếu có)
-client = Client() if G4F_AVAILABLE else None
+# Helper decorator to run function in background
+def async_task(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        return executor.submit(func, *args, **kwargs)
+    return wrapper
 
-# --- Các hàm tiện ích (không thay đổi nhiều) ---
+class UltraFastChatBot:
+    _instance = None
+    _lock = threading.Lock()
 
-def get_storage_headers():
-    headers = {"Content-Type": "application/json"}
-    if STORAGE_API_KEY:
-        headers["X-Master-Key"] = STORAGE_API_KEY
-    return headers
+    def __new__(cls, *args, **kwargs):
+        if not cls._instance:
+            with cls._lock:
+                if not cls._instance:
+                    cls._instance = super().__new__(cls)
+        return cls._instance
 
-def load_history():
-    if not STORAGE_API_URL: return []
-    try:
-        res = requests.get(f"{STORAGE_API_URL}/latest", headers=get_storage_headers(), timeout=5)
-        if res.status_code == 200:
-            data = res.json()
-            # Hỗ trợ cả định dạng record của JSONBin và mảng thuần
-            messages = data.get("record", data if isinstance(data, list) else [])
-            return messages[-MAX_HISTORY_MESSAGES:] if isinstance(messages, list) else []
-    except Exception as e:
-        app.logger.error(f"Failed to load history: {e}")
-    return []
+    def __init__(self, max_messages=MAX_MESSAGES):
+        if getattr(self, "initialized", False):
+            return
 
-def save_history(messages):
-    if not STORAGE_API_URL: return False
-    try:
-        limited_messages = messages[-MAX_HISTORY_MESSAGES:]
-        res = requests.put(STORAGE_API_URL, json=limited_messages, headers=get_storage_headers(), timeout=5)
-        return res.status_code == 200
-    except Exception as e:
-        app.logger.error(f"Failed to save history: {e}")
-        return False
+        # Lazy Client import to avoid import-time failures
+        try:
+            import g4f
+            self._client_available = True
+        except Exception as e:
+            logger.warning(f"G4F import failed: {e}")
+            self._client_available = False
 
-def build_prompt(messages, user_input):
-    now = datetime.now(VIETNAM_TZ).strftime('%A, %d/%m/%Y, %H:%M:%S')
-    system_prompt = {"role": "system", "content": f"You are a helpful AI assistant. Current time in Vietnam: {now}."}
-    recent_messages = messages[-(MAX_PAYLOAD_MESSAGES - 1):] if messages else []
-    return [system_prompt] + recent_messages + [{"role": "user", "content": user_input}]
+        self.max_messages = max_messages
+        self.messages = []  # in-memory store: list of {"role","content","timestamp"}
+        self._message_cache = {}
+        self._last_save_time = 0.0
+        self._save_interval = 3.0
+        self._lock = threading.RLock()
+        self._vietnam_tz = VIETNAM_TZ
+        self.initialized = True
 
+    def _now_ts(self):
+        return datetime.now(self._vietnam_tz).strftime("%Y-%m-%d %H:%M:%S")
 
-# --- API Endpoints ---
+    def get_vietnam_time_info(self):
+        vn = datetime.now(self._vietnam_tz)
+        weekdays = ['Thứ Hai','Thứ Ba','Thứ Tư','Thứ Năm','Thứ Sáu','Thứ Bảy','Chủ Nhật']
+        weekday_vn = weekdays[vn.weekday()]
+        months = ['Tháng 1','Tháng 2','Tháng 3','Tháng 4','Tháng 5','Tháng 6',
+                  'Tháng 7','Tháng 8','Tháng 9','Tháng 10','Tháng 11','Tháng 12']
+        month_vn = months[vn.month - 1]
+        return {
+            'current_time': vn.strftime('%H:%M:%S'),
+            'current_date': f"{vn.day} {month_vn} năm {vn.year}",
+            'weekday': weekday_vn,
+            'full_datetime': f"{weekday_vn}, {vn.day} {month_vn} {vn.year} lúc {vn.strftime('%H:%M:%S')}",
+            'timestamp': vn.timestamp(),
+            'location': 'Khánh Hòa, Việt Nam'
+        }
 
+    def _trim_messages(self):
+        if len(self.messages) > self.max_messages:
+            with self._lock:
+                system_msgs = [m for m in self.messages if m.get("role") == "system"]
+                recent = [m for m in self.messages if m.get("role") != "system"][-int(self.max_messages*0.6):]
+                self.messages = system_msgs + recent
+
+    def clear_history(self):
+        with self._lock:
+            self.messages = []
+            self._message_cache.clear()
+
+    def _build_minimal_payload(self, user_input):
+        system_msgs = [{"role": m["role"], "content": m["content"]} for m in self.messages if m.get("role") == "system"]
+        non_system = [{"role": m["role"], "content": m["content"]} for m in self.messages if m.get("role") in ("user","assistant")]
+        recent = non_system[-MAX_INPUT_MESSAGES:] if non_system else []
+        payload = system_msgs + recent + [{"role": "user", "content": user_input}]
+        return payload
+
+    def add_system_with_time(self):
+        # remove old system messages and insert fresh one
+        with self._lock:
+            self.messages = [m for m in self.messages if m.get("role") != "system"]
+            time_info = self.get_vietnam_time_info()
+            system_content = f"Bạn là trợ lý AI tại {time_info['location']}. Thời gian hiện tại: {time_info['full_datetime']}."
+            self.messages.insert(0, {"role":"system","content":system_content,"timestamp": self._now_ts()})
+
+    # --- Core LLM call (ultra-minimal payload) ---
+    def get_response_ultra_fast(self, user_input):
+        start = time.time()
+        try:
+            # ensure system msg exists
+            if not any(m.get("role") == "system" for m in self.messages) or len(self.messages) % 5 == 0:
+                self.add_system_with_time()
+
+            payload_messages = self._build_minimal_payload(user_input)
+
+            bot_reply = None
+            # call g4f if available, else fallback
+            if self._client_available:
+                try:
+                    import g4f
+                    response = g4f.ChatCompletion.create(
+                        model=MODEL_NAME,
+                        messages=payload_messages,
+                        max_tokens=600,
+                        temperature=0.5,
+                        top_p=0.9,
+                        timeout=API_CALL_TIMEOUT
+                    )
+                    bot_reply = response.strip()
+                except Exception as e:
+                    logger.error(f"G4F error: {e}")
+                    bot_reply = None
+
+            if not bot_reply or len(bot_reply) < 2:
+                bot_reply = "Xin lỗi, hiện tại tôi không truy cập được mô-đun trả lời nhanh. Bạn có thể thử lại hoặc chờ một chút."
+
+            # append into history
+            ts = self._now_ts()
+            with self._lock:
+                self.messages.append({"role":"user","content":user_input,"timestamp":ts})
+                self.messages.append({"role":"assistant","content":bot_reply,"timestamp":ts})
+                # manage memory
+                if len(self.messages) > int(self.max_messages * 0.8):
+                    self._trim_messages()
+
+            elapsed = time.time() - start
+            if elapsed > 10:
+                logger.warning(f"Slow response: {elapsed:.2f}s")
+
+            return bot_reply
+        except Exception as e:
+            logger.error(f"Error in get_response_ultra_fast: {e}")
+            # on error, still try to record user message
+            try:
+                with self._lock:
+                    self.messages.append({"role":"user","content":user_input,"timestamp": self._now_ts()})
+            except:
+                pass
+            return "Hệ thống đang bận, vui lòng thử lại sau ít phút."
+
+# Global bot
+bot = UltraFastChatBot()
+
+# ---------- Routes ----------
 @app.route("/")
-def home():
-    return render_template("sv.html")
+def index():
+    try:
+        return render_template("sv.html")
+    except Exception as e:
+        return f"<h3>UI not found — {e}</h3>", 404
 
 @app.route("/api/chat", methods=["POST"])
-def api_chat_stream():
-    """
-    Endpoint chính, đã được gia cố để chống crash và báo lỗi rõ ràng.
-    """
+def api_chat():
     try:
-        data = request.get_json(silent=True)
-        user_message = data.get("message", "").strip()
+        if not request.is_json:
+            return jsonify({"ok": False, "error": "Invalid content type"}), 400
+        data = request.get_json(force=True, silent=True)
+        if not data:
+            return jsonify({"ok": False, "error": "Invalid JSON"}), 400
 
-        if not user_message:
-            return jsonify({"error": "Message is empty"}), 400
-        if not client:
-            return jsonify({"error": "g4f library not available on server."}), 500
+        message = (data.get("message") or "").strip()
+        if not message:
+            return jsonify({"ok": False, "error": "Empty message"}), 400
+        if len(message) > 1500:
+            return jsonify({"ok": False, "error": "Message too long"}), 400
 
-        app.logger.info(f"Received message: {user_message}")
+        # quick clear commands
+        if message.lower() in ("clear","/clear","xóa","xoa"):
+            bot.clear_history()
+            return jsonify({"ok": True, "reply": "Đã xóa lịch sử chat."})
 
-        def generate_response():
-            messages = []
-            full_response = ""
-            try:
-                # Tải lịch sử bên trong generator để đảm bảo luôn mới nhất
-                messages = load_history()
-                payload = build_prompt(messages, user_message)
-                
-                app.logger.info(f"Using provider: {G4F_PROVIDER.__name__}")
-                
-                response_stream = client.chat.completions.create(
-                    model=MODEL_NAME,
-                    messages=payload,
-                    stream=True,
-                    timeout=API_CALL_TIMEOUT,
-                    provider=G4F_PROVIDER # <--- MỚI: Chỉ định provider rõ ràng
-                )
+        # time shortcut
+        time_keywords = ["giờ","thời gian","ngày","tháng","năm","bây giờ","hiện tại"]
+        if any(k in message.lower() for k in time_keywords):
+            time_info = bot.get_vietnam_time_info()
+            reply = f"Hiện tại là {time_info['full_datetime']} tại {time_info['location']}."
+            ts = bot._now_ts()
+            with bot._lock:
+                bot.messages.append({"role":"user","content":message,"timestamp":ts})
+                bot.messages.append({"role":"assistant","content":reply,"timestamp":ts})
+            return jsonify({"ok": True, "reply": reply})
 
-                for chunk in response_stream:
-                    content = chunk.choices[0].delta.content
-                    if content:
-                        full_response += content
-                        yield f"data: {json.dumps({'delta': content})}\n\n"
-            
-            except Exception as e:
-                # --- MỚI: Bắt lỗi từ g4f và báo về cho client ---
-                app.logger.error(f"An error occurred during stream generation: {e}", exc_info=True)
-                error_message = f"Xin lỗi, đã có lỗi từ nhà cung cấp AI ({G4F_PROVIDER.__name__}): {str(e)}"
-                yield f"data: {json.dumps({'error': error_message})}\n\n"
-                # Vẫn lưu lại lỗi để biết ngữ cảnh
-                full_response = error_message
-            finally:
-                # --- MỚI: Luôn luôn lưu lại lịch sử, kể cả khi có lỗi ---
-                if user_message and full_response:
-                    messages.append({"role": "user", "content": user_message})
-                    messages.append({"role": "assistant", "content": full_response.strip()})
-                    save_history(messages)
-                    app.logger.info("History saved.")
-
-        return Response(generate_response(), mimetype='text/event-stream')
-
+        # otherwise ask LLM (or fallback)
+        reply = bot.get_response_ultra_fast(message)
+        return jsonify({"ok": True, "reply": reply})
     except Exception as e:
-        # --- MỚI: Bắt lỗi toàn cục để server không bao giờ crash ---
-        app.logger.error(f"A critical error occurred in /api/chat: {e}", exc_info=True)
-        return jsonify({"error": "A critical server error occurred."}), 500
-
+        logger.error(f"API chat error: {e}")
+        return jsonify({"ok": False, "error": "Server busy"}), 500
 
 @app.route("/api/history", methods=["GET"])
 def api_history():
-    return jsonify({"messages": load_history()})
+    try:
+        return jsonify({"ok": True, "messages": bot.messages[-30:]})
+    except Exception as e:
+        logger.error(f"API history error: {e}")
+        return jsonify({"ok": True, "messages": []})
 
 @app.route("/api/clear", methods=["POST"])
 def api_clear():
-    if save_history([]):
-        return jsonify({"message": "History cleared"})
-    return jsonify({"error": "Failed to clear history"}), 500
+    try:
+        bot.clear_history()
+        return jsonify({"ok": True, "message": "Cleared"})
+    except Exception as e:
+        logger.error(f"API clear error: {e}")
+        return jsonify({"ok": False, "error": "Error"}), 500
+
+@app.route("/api/status", methods=["GET"])
+def api_status():
+    try:
+        t = bot.get_vietnam_time_info()
+        return jsonify({"ok": True, "status":"online", "messages_count": len(bot.messages), "vietnam_time": t['current_time']})
+    except Exception as e:
+        logger.error(f"API status error: {e}")
+        return jsonify({"ok": True, "status":"online"})
+
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify({"ok": False, "error": "Not found"}), 404
+
+@app.errorhandler(500)
+def internal_err(e):
+    return jsonify({"ok": False, "error": "Server error"}), 500
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True, use_reloader=False)
