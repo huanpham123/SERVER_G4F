@@ -2,30 +2,52 @@ import os
 import json
 import requests
 import pytz
+import logging
 from datetime import datetime
 from flask import Flask, request, jsonify, Response, render_template
 from flask_cors import CORS
 
-# Lazy import g4f để Vercel build không bị lỗi
+# --- Cấu hình logging để dễ dàng debug trên Vercel ---
+logging.basicConfig(level=logging.INFO)
+
+# --- Lazy import g4f để Vercel build không bị lỗi ---
 try:
     from g4f.client import Client
-    from g4f.errors import G4fError
+    # Chọn một vài provider được đánh giá là ổn định hơn
+    from g4f.Provider import (
+        Liaobots,
+        GeekGpt,
+        AiChatOnline,
+    )
     G4F_AVAILABLE = True
-except ImportError:
+except ImportError as e:
+    logging.error(f"g4f import error: {e}")
     G4F_AVAILABLE = False
 
-# --- Cấu hình ---
+# --- Cấu hình ứng dụng ---
 # Lấy cấu hình từ biến môi trường của Vercel
 VIETNAM_TZ = pytz.timezone(os.getenv("VIETNAM_TZ", "Asia/Ho_Chi_Minh"))
 MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o-mini")
-API_CALL_TIMEOUT = int(os.getenv("API_CALL_TIMEOUT", 25))
+API_CALL_TIMEOUT = int(os.getenv("API_CALL_TIMEOUT", 30)) # Tăng timeout lên một chút
 MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", 20))
-MAX_PAYLOAD_MESSAGES = int(os.getenv("MAX_PAYLOAD_MESSAGES", 5))
+MAX_PAYLOAD_MESSAGES = int(os.getenv("MAX_PAYLOAD_MESSAGES", 7)) # Gửi nhiều ngữ cảnh hơn một chút
 
-# URL API để lưu trữ lịch sử chat. BẮT BUỘC PHẢI CÓ ĐỂ DEPLOY.
+# URL API để lưu trữ lịch sử chat (BẮT BUỘC)
 STORAGE_API_URL = os.getenv("STORAGE_API_URL")
-# Một số dịch vụ (như JSONBin.io) yêu cầu API key.
 STORAGE_API_KEY = os.getenv("STORAGE_API_KEY")
+
+# --- MỚI: Cho phép chọn Provider qua biến môi trường ---
+# Bạn có thể đặt G4F_PROVIDER trên Vercel là "GeekGpt", "Liaobots", etc.
+# Nếu không đặt, nó sẽ thử Liaobots trước.
+DEFAULT_PROVIDER = Liaobots
+PROVIDER_MAP = {
+    "Liaobots": Liaobots,
+    "GeekGpt": GeekGpt,
+    "AiChatOnline": AiChatOnline,
+}
+SELECTED_PROVIDER_NAME = os.getenv("G4F_PROVIDER", "Liaobots")
+G4F_PROVIDER = PROVIDER_MAP.get(SELECTED_PROVIDER_NAME, DEFAULT_PROVIDER)
+
 
 # --- Khởi tạo Flask App ---
 app = Flask(__name__, template_folder="templates")
@@ -34,59 +56,43 @@ CORS(app, resources={r"/api/*": {"origins": "*"}})
 # Khởi tạo g4f client (nếu có)
 client = Client() if G4F_AVAILABLE else None
 
-# --- Các hàm tiện ích ---
-
-def get_vietnam_time_info():
-    """Lấy thông tin thời gian hiện tại ở Việt Nam."""
-    now = datetime.now(VIETNAM_TZ)
-    return {
-        'full_datetime': now.strftime('%A, %d/%m/%Y, %H:%M:%S'),
-        'location': 'Phan Rang–Tháp Chàm, Ninh Thuận, Vietnam'
-    }
+# --- Các hàm tiện ích (không thay đổi nhiều) ---
 
 def get_storage_headers():
-    """Tạo headers để gọi API lưu trữ."""
     headers = {"Content-Type": "application/json"}
     if STORAGE_API_KEY:
-        # JSONBin.io dùng 'X-Master-Key'. Dịch vụ khác có thể dùng key khác.
         headers["X-Master-Key"] = STORAGE_API_KEY
     return headers
 
 def load_history():
-    """Tải lịch sử chat từ dịch vụ lưu trữ ngoài."""
-    if not STORAGE_API_URL:
-        return []
+    if not STORAGE_API_URL: return []
     try:
         res = requests.get(f"{STORAGE_API_URL}/latest", headers=get_storage_headers(), timeout=5)
         if res.status_code == 200:
             data = res.json()
-            # JSONBin.io gói dữ liệu trong key "record".
-            messages = data.get("record", [])
-            return messages[-MAX_HISTORY_MESSAGES:]
-    except (requests.RequestException, json.JSONDecodeError):
-        pass # Bỏ qua lỗi nếu không tải được
+            # Hỗ trợ cả định dạng record của JSONBin và mảng thuần
+            messages = data.get("record", data if isinstance(data, list) else [])
+            return messages[-MAX_HISTORY_MESSAGES:] if isinstance(messages, list) else []
+    except Exception as e:
+        app.logger.error(f"Failed to load history: {e}")
     return []
 
 def save_history(messages):
-    """Lưu lịch sử chat ra dịch vụ lưu trữ ngoài."""
-    if not STORAGE_API_URL:
-        return False
+    if not STORAGE_API_URL: return False
     try:
         limited_messages = messages[-MAX_HISTORY_MESSAGES:]
         res = requests.put(STORAGE_API_URL, json=limited_messages, headers=get_storage_headers(), timeout=5)
         return res.status_code == 200
-    except requests.RequestException:
+    except Exception as e:
+        app.logger.error(f"Failed to save history: {e}")
         return False
 
 def build_prompt(messages, user_input):
-    """Xây dựng prompt cho AI từ lịch sử và thông tin hệ thống."""
-    time_info = get_vietnam_time_info()
-    system_prompt = {
-        "role": "system",
-        "content": f"You are a helpful AI assistant. Current location: {time_info['location']}. Current time: {time_info['full_datetime']}."
-    }
+    now = datetime.now(VIETNAM_TZ).strftime('%A, %d/%m/%Y, %H:%M:%S')
+    system_prompt = {"role": "system", "content": f"You are a helpful AI assistant. Current time in Vietnam: {now}."}
     recent_messages = messages[-(MAX_PAYLOAD_MESSAGES - 1):] if messages else []
     return [system_prompt] + recent_messages + [{"role": "user", "content": user_input}]
+
 
 # --- API Endpoints ---
 
@@ -96,42 +102,66 @@ def home():
 
 @app.route("/api/chat", methods=["POST"])
 def api_chat_stream():
-    """Endpoint chính, sử dụng streaming để trả lời, chống timeout."""
-    data = request.get_json(silent=True)
-    user_message = data.get("message", "").strip()
+    """
+    Endpoint chính, đã được gia cố để chống crash và báo lỗi rõ ràng.
+    """
+    try:
+        data = request.get_json(silent=True)
+        user_message = data.get("message", "").strip()
 
-    if not user_message:
-        return jsonify({"error": "Empty message"}), 400
-    if not client:
-        return jsonify({"error": "g4f library is not available."}), 500
+        if not user_message:
+            return jsonify({"error": "Message is empty"}), 400
+        if not client:
+            return jsonify({"error": "g4f library not available on server."}), 500
 
-    def generate_response():
-        messages = load_history()
-        payload = build_prompt(messages, user_message)
-        full_response = ""
-        
-        try:
-            response_stream = client.chat.completions.create(
-                model=MODEL_NAME, messages=payload, stream=True, timeout=API_CALL_TIMEOUT
-            )
-            for chunk in response_stream:
-                content = chunk.choices[0].delta.content
-                if content:
-                    full_response += content
-                    yield f"data: {json.dumps({'delta': content})}\n\n"
-        
-        except Exception as e:
-            error_message = f"Lỗi: {str(e)}"
-            yield f"data: {json.dumps({'error': error_message})}\n\n"
-            full_response = error_message
-        
-        # Sau khi stream kết thúc, cập nhật và lưu lại lịch sử
-        if full_response:
-             messages.append({"role": "user", "content": user_message})
-             messages.append({"role": "assistant", "content": full_response.strip()})
-             save_history(messages)
+        app.logger.info(f"Received message: {user_message}")
 
-    return Response(generate_response(), mimetype='text/event-stream')
+        def generate_response():
+            messages = []
+            full_response = ""
+            try:
+                # Tải lịch sử bên trong generator để đảm bảo luôn mới nhất
+                messages = load_history()
+                payload = build_prompt(messages, user_message)
+                
+                app.logger.info(f"Using provider: {G4F_PROVIDER.__name__}")
+                
+                response_stream = client.chat.completions.create(
+                    model=MODEL_NAME,
+                    messages=payload,
+                    stream=True,
+                    timeout=API_CALL_TIMEOUT,
+                    provider=G4F_PROVIDER # <--- MỚI: Chỉ định provider rõ ràng
+                )
+
+                for chunk in response_stream:
+                    content = chunk.choices[0].delta.content
+                    if content:
+                        full_response += content
+                        yield f"data: {json.dumps({'delta': content})}\n\n"
+            
+            except Exception as e:
+                # --- MỚI: Bắt lỗi từ g4f và báo về cho client ---
+                app.logger.error(f"An error occurred during stream generation: {e}", exc_info=True)
+                error_message = f"Xin lỗi, đã có lỗi từ nhà cung cấp AI ({G4F_PROVIDER.__name__}): {str(e)}"
+                yield f"data: {json.dumps({'error': error_message})}\n\n"
+                # Vẫn lưu lại lỗi để biết ngữ cảnh
+                full_response = error_message
+            finally:
+                # --- MỚI: Luôn luôn lưu lại lịch sử, kể cả khi có lỗi ---
+                if user_message and full_response:
+                    messages.append({"role": "user", "content": user_message})
+                    messages.append({"role": "assistant", "content": full_response.strip()})
+                    save_history(messages)
+                    app.logger.info("History saved.")
+
+        return Response(generate_response(), mimetype='text/event-stream')
+
+    except Exception as e:
+        # --- MỚI: Bắt lỗi toàn cục để server không bao giờ crash ---
+        app.logger.error(f"A critical error occurred in /api/chat: {e}", exc_info=True)
+        return jsonify({"error": "A critical server error occurred."}), 500
+
 
 @app.route("/api/history", methods=["GET"])
 def api_history():
