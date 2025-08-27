@@ -1,540 +1,230 @@
 <!DOCTYPE html>
 <html lang="vi">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>⚡ Fast Chatbot API - Flask</title>
-  <style>
-    * { box-sizing: border-box; }
-    body { 
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, system-ui, sans-serif; 
-      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-      margin: 0; padding: 16px; 
-      min-height: 100vh; 
-      display: flex; align-items: center; justify-content: center; 
-    }
-    .card { 
-      width: 100%; max-width: 800px; 
-      background: rgba(255,255,255,0.95); 
-      backdrop-filter: blur(10px);
-      border-radius: 20px; 
-      box-shadow: 0 20px 40px rgba(0,0,0,0.1); 
-      padding: 24px; 
-      border: 1px solid rgba(255,255,255,0.2);
-    }
-    .header {
-      text-align: center; margin-bottom: 20px;
-    }
-    .header h1 {
-      margin: 0; color: #2d3748; font-size: 24px; font-weight: 700;
-    }
-    .status {
-      display: inline-block; padding: 4px 12px; border-radius: 12px; 
-      font-size: 12px; font-weight: 600; margin-top: 8px;
-    }
-    .status.online { background: #c6f6d5; color: #22543d; }
-    .status.offline { background: #fed7d7; color: #742a2a; }
-    .messages { 
-      height: 50vh; min-height: 300px; max-height: 600px;
-      overflow-y: auto; 
-      border: 1px solid #e2e8f0; 
-      border-radius: 16px; 
-      padding: 16px; 
-      background: linear-gradient(to bottom, #f7fafc, #edf2f7);
-      scroll-behavior: smooth;
-    }
-    .msg { margin: 12px 0; animation: fadeIn 0.3s ease-out; }
-    .msg.user { text-align: right; }
-    .msg.bot { text-align: left; }
-    .bubble { 
-      display: inline-block; 
-      padding: 12px 16px; 
-      border-radius: 18px; 
-      max-width: 80%; 
-      white-space: pre-wrap; 
-      word-wrap: break-word; 
-      position: relative;
-      font-size: 14px;
-      line-height: 1.4;
-    }
-    .bubble.user { 
-      background: linear-gradient(135deg, #4299e1, #3182ce); 
-      color: white; 
-      box-shadow: 0 4px 12px rgba(66, 153, 225, 0.3);
-    }
-    .bubble.bot { 
-      background: white; 
-      color: #2d3748; 
-      border: 1px solid #e2e8f0;
-      box-shadow: 0 2px 8px rgba(0,0,0,0.1);
-    }
-    .bubble.typing {
-      background: #f7fafc;
-      border: 1px dashed #cbd5e0;
-      animation: pulse 1.5s infinite;
-    }
-    .controls { 
-      display: flex; gap: 12px; margin-top: 20px; 
-    }
-    .input-wrapper {
-      flex: 1; position: relative;
-    }
-    input[type="text"] { 
-      width: 100%; 
-      padding: 14px 50px 14px 16px; 
-      border-radius: 25px; 
-      border: 2px solid #e2e8f0; 
-      font-size: 14px;
-      outline: none;
-      transition: all 0.2s;
-      background: white;
-    }
-    input[type="text"]:focus { 
-      border-color: #4299e1; 
-      box-shadow: 0 0 0 3px rgba(66, 153, 225, 0.1);
-    }
-    input[type="text"]:disabled {
-      opacity: 0.6; cursor: not-allowed;
-    }
-    .send-btn {
-      position: absolute; right: 8px; top: 50%; 
-      transform: translateY(-50%);
-      background: linear-gradient(135deg, #48bb78, #38a169); 
-      border: none; border-radius: 50%;
-      width: 36px; height: 36px;
-      cursor: pointer; display: flex; align-items: center; justify-content: center;
-      transition: all 0.2s; color: white; font-size: 16px;
-    }
-    .send-btn:hover:not(:disabled) { 
-      transform: translateY(-50%) scale(1.1); 
-      box-shadow: 0 4px 12px rgba(72, 187, 120, 0.4);
-    }
-    .send-btn:disabled {
-      opacity: 0.5; cursor: not-allowed; transform: translateY(-50%);
-    }
-    .btn { 
-      padding: 12px 20px; 
-      border-radius: 25px; 
-      border: none; 
-      cursor: pointer; 
-      font-weight: 600; 
-      font-size: 14px;
-      transition: all 0.2s;
-      display: flex; align-items: center; gap: 8px;
-    }
-    .btn.clear { 
-      background: #fed7d7; color: #c53030; 
-    }
-    .btn.clear:hover { 
-      background: #fc8181; color: white; 
-      transform: translateY(-1px);
-    }
-    .meta { 
-      font-size: 11px; color: #718096; 
-      margin-bottom: 16px; text-align: center;
-      padding: 8px; background: rgba(113, 128, 150, 0.1); 
-      border-radius: 8px;
-    }
-    .typing-indicator {
-      display: inline-block;
-    }
-    .typing-indicator::after {
-      content: '';
-      animation: dots 1.5s infinite;
-    }
-    .error-msg {
-      color: #e53e3e; background: #fed7d7;
-      padding: 8px 12px; border-radius: 8px; margin: 4px 0;
-      font-size: 12px;
-    }
-    .retry-btn {
-      background: #e53e3e; color: white; border: none;
-      padding: 4px 8px; border-radius: 4px; cursor: pointer;
-      font-size: 10px; margin-left: 8px;
-    }
-    
-    /* Animations */
-    @keyframes fadeIn {
-      from { opacity: 0; transform: translateY(10px); }
-      to { opacity: 1; transform: translateY(0); }
-    }
-    @keyframes pulse {
-      0%, 100% { opacity: 0.7; }
-      50% { opacity: 1; }
-    }
-    @keyframes dots {
-      0%, 20% { content: '●'; }
-      40% { content: '● ●'; }
-      60% { content: '● ● ●'; }
-      80%, 100% { content: '● ● ● ●'; }
-    }
-    
-    /* Responsive */
-    @media (max-width: 640px) {
-      body { padding: 8px; }
-      .card { padding: 16px; }
-      .controls { flex-direction: column; }
-      .btn { justify-content: center; }
-    }
-  </style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Vercel Chatbot</title>
+    <style>
+        :root {
+            --bg-color: #121212;
+            --text-color: #e0e0e0;
+            --primary-color: #4A90E2;
+            --user-msg-bg: #2c3e50;
+            --bot-msg-bg: #34495e;
+            --input-bg: #1e1e1e;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            margin: 0;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+        }
+        #chat-container {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            max-width: 800px;
+            width: 100%;
+            margin: 0 auto;
+            padding: 10px;
+            box-sizing: border-box;
+        }
+        #chat-header {
+            text-align: center;
+            padding: 15px;
+            border-bottom: 1px solid var(--bot-msg-bg);
+        }
+        h1 { margin: 0; font-size: 1.5rem; }
+        .subtitle { font-size: 0.9rem; opacity: 0.7; }
+        #message-list {
+            flex: 1;
+            overflow-y: auto;
+            padding: 10px;
+            display: flex;
+            flex-direction: column-reverse;
+        }
+        .message {
+            max-width: 80%;
+            padding: 12px 18px;
+            border-radius: 18px;
+            margin-bottom: 10px;
+            line-height: 1.4;
+            word-wrap: break-word;
+        }
+        .user {
+            background-color: var(--user-msg-bg);
+            align-self: flex-end;
+            border-bottom-right-radius: 4px;
+        }
+        .assistant {
+            background-color: var(--bot-msg-bg);
+            align-self: flex-start;
+            border-bottom-left-radius: 4px;
+        }
+        #chat-form {
+            display: flex;
+            padding: 10px;
+            gap: 10px;
+        }
+        #message-input {
+            flex: 1;
+            padding: 12px;
+            border: 1px solid var(--bot-msg-bg);
+            border-radius: 20px;
+            background-color: var(--input-bg);
+            color: var(--text-color);
+            font-size: 1rem;
+        }
+        button {
+            padding: 12px 20px;
+            border: none;
+            background-color: var(--primary-color);
+            color: white;
+            border-radius: 20px;
+            cursor: pointer;
+            font-size: 1rem;
+        }
+        button:disabled {
+            background-color: #555;
+            cursor: not-allowed;
+        }
+        #clear-btn { background-color: #e74c3c; }
+        #typing-indicator {
+            align-self: flex-start;
+            color: #999;
+            padding-left: 20px;
+            font-style: italic;
+            display: none;
+        }
+    </style>
 </head>
 <body>
-  <div class="card">
-    <div class="header">
-      <h1>⚡ Fast AI Chatbot</h1>
-      <div class="status" id="status">🔄 Connecting...</div>
-    </div>
-    
-    <div class="meta">
-      <strong>API:</strong> <code>/api/chat</code> • 
-      <strong>Location:</strong> Khánh Hòa, Việt Nam (UTC+7) • 
-      <span id="msg-count">0</span> messages • 
-      <span id="current-time">--:--:--</span>
-    </div>
-    
-    <div class="messages" id="messages" aria-live="polite" aria-label="Chat messages"></div>
 
-    <div class="controls">
-      <div class="input-wrapper">
-        <input 
-          id="input" 
-          type="text" 
-          placeholder="Nhập câu hỏi và nhấn Enter..." 
-          autocomplete="off" 
-          maxlength="2000"
-          aria-label="Message input"
-        />
-        <button class="send-btn" id="send" title="Send message" aria-label="Send">
-          ➤
-        </button>
-      </div>
-      <button class="btn clear" id="clear" title="Clear chat history">
-        🗑️ Clear
-      </button>
+<div id="chat-container">
+    <div id="chat-header">
+        <h1>Chatbot AI</h1>
+        <div class="subtitle">Powered by g4f & Vercel</div>
     </div>
-  </div>
+    
+    <div id="message-list-wrapper">
+        <div id="message-list">
+             <div id="typing-indicator">AI is typing...</div>
+        </div>
+    </div>
+
+    <form id="chat-form">
+        <input type="text" id="message-input" placeholder="Nhập tin nhắn..." autocomplete="off">
+        <button type="submit" id="send-btn">Gửi</button>
+        <button type="button" id="clear-btn">Xóa</button>
+    </form>
+</div>
 
 <script>
-(function() {
-  'use strict';
-  
-  // DOM elements
-  const messagesEl = document.getElementById('messages');
-  const inputEl = document.getElementById('input');
-  const sendBtn = document.getElementById('send');
-  const clearBtn = document.getElementById('clear');
-  const statusEl = document.getElementById('status');
-  const msgCountEl = document.getElementById('msg-count');
-  
-  // State
-  let isTyping = false;
-  let messageCount = 0;
-  let lastMessageTime = 0;
-  const MESSAGE_CACHE = new Map();
-  const DEBOUNCE_DELAY = 200; // Reduced for faster response
-  
-  // Vietnam timezone elements
-  const currentTimeEl = document.getElementById('current-time');
-  
-  // Utility functions
-  function debounce(func, wait) {
-    let timeout;
-    return function executedFunction(...args) {
-      const later = () => {
-        clearTimeout(timeout);
-        func(...args);
-      };
-      clearTimeout(timeout);
-      timeout = setTimeout(later, wait);
-    };
-  }
-  
-  function updateStatus(text, className = 'online') {
-    statusEl.textContent = text;
-    statusEl.className = `status ${className}`;
-  }
-  
-  function updateMessageCount() {
-    msgCountEl.textContent = messageCount;
-  }
-  
-  // Optimized message display
-  function showMessage(role, text, isTemp = false) {
-    const wrap = document.createElement('div');
-    wrap.className = `msg ${role === 'user' ? 'user' : 'bot'}`;
-    
-    const bubble = document.createElement('div');
-    bubble.className = `bubble ${role === 'user' ? 'user' : 'bot'} ${isTemp ? 'typing' : ''}`;
-    
-    if (isTemp) {
-      bubble.innerHTML = '<span class="typing-indicator">Đang xử lý</span>';
-    } else {
-      bubble.textContent = text;
-      messageCount++;
-      updateMessageCount();
+    const chatForm = document.getElementById('chat-form');
+    const messageInput = document.getElementById('message-input');
+    const messageList = document.getElementById('message-list');
+    const sendBtn = document.getElementById('send-btn');
+    const clearBtn = document.getElementById('clear-btn');
+    const typingIndicator = document.getElementById('typing-indicator');
+
+    // Hàm render tin nhắn
+    function addMessage(role, content) {
+        const messageDiv = document.createElement('div');
+        messageDiv.className = `message ${role}`;
+        // Chuyển đổi markdown đơn giản sang HTML (xuống dòng)
+        messageDiv.innerHTML = content.replace(/\n/g, '<br>');
+        messageList.prepend(messageDiv);
+        return messageDiv;
     }
-    
-    wrap.appendChild(bubble);
-    messagesEl.appendChild(wrap);
-    
-    // Smooth scroll to bottom
-    requestAnimationFrame(() => {
-      messagesEl.scrollTop = messagesEl.scrollHeight;
+
+    // Tải lịch sử chat khi mở trang
+    async function loadInitialHistory() {
+        try {
+            const response = await fetch('/api/history');
+            const data = await response.json();
+            messageList.innerHTML = '<div id="typing-indicator" style="display: none;">AI is typing...</div>'; // Xóa tin nhắn cũ
+            if (data.messages) {
+                data.messages.reverse().forEach(msg => addMessage(msg.role, msg.content));
+            }
+        } catch (error) {
+            console.error('Error loading history:', error);
+        }
+    }
+
+    // Xử lý gửi tin nhắn
+    chatForm.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const userMessage = messageInput.value.trim();
+        if (!userMessage) return;
+
+        addMessage('user', userMessage);
+        messageInput.value = '';
+        sendBtn.disabled = true;
+        typingIndicator.style.display = 'block';
+
+        let botMessageDiv = addMessage('assistant', '');
+        let currentResponse = '';
+
+        try {
+            const eventSource = new EventSource(`/api/chat?message=${encodeURIComponent(userMessage)}`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ message: userMessage })
+            });
+
+            eventSource.onmessage = function(event) {
+                const data = JSON.parse(event.data);
+
+                if (data.error) {
+                    currentResponse += `<span style="color: #ffcccc;">${data.error}</span>`;
+                    eventSource.close(); // Đóng kết nối khi có lỗi
+                } else if (data.delta) {
+                    currentResponse += data.delta;
+                }
+                botMessageDiv.innerHTML = currentResponse.replace(/\n/g, '<br>');
+            };
+
+            eventSource.onerror = function() {
+                console.error('EventSource failed.');
+                botMessageDiv.innerHTML += '<br><span style="color: #ffcccc;">Connection error. Please try again.</span>';
+                eventSource.close();
+                sendBtn.disabled = false;
+                typingIndicator.style.display = 'none';
+            };
+
+            // Vercel có thể đóng stream sớm, nên ta cũng cần lắng nghe sự kiện đóng
+            eventSource.addEventListener('close', () => {
+                eventSource.close();
+                sendBtn.disabled = false;
+                typingIndicator.style.display = 'none';
+            });
+
+
+        } catch (error) {
+            console.error('Error sending message:', error);
+            botMessageDiv.innerHTML += `<br><span style="color: #ffcccc;">Error: ${error.message}</span>`;
+            sendBtn.disabled = false;
+            typingIndicator.style.display = 'none';
+        }
     });
     
-    return bubble;
-  }
-  
-  function removeTypingIndicator() {
-    const typingBubbles = messagesEl.querySelectorAll('.bubble.typing');
-    typingBubbles.forEach(bubble => bubble.parentElement.remove());
-  }
-  
-  // Update Vietnam time display
-  function updateVietnamTime() {
-    if (currentTimeEl) {
-      const now = new Date();
-      // Vietnam is UTC+7
-      const vietnamTime = new Date(now.getTime() + (7 * 60 * 60 * 1000));
-      const timeStr = vietnamTime.toUTCString().slice(-12, -4);
-      currentTimeEl.textContent = timeStr;
-    }
-  }
-
-  // Ultra-fast API communication with reduced timeout  
-  async function sendMessage(message) {
-    if (isTyping || !message.trim()) return;
-    
-    const trimmedMessage = message.trim();
-    const now = Date.now();
-    
-    // Aggressive rate limiting
-    if (now - lastMessageTime < 800) {
-      showError('Vui lòng chờ một chút...');
-      return;
-    }
-    lastMessageTime = now;
-    
-    // Check cache with shorter expiry
-    const cachedResponse = MESSAGE_CACHE.get(trimmedMessage.toLowerCase());
-    if (cachedResponse && now - cachedResponse.timestamp < 180000) { // 3 min cache
-      showMessage('user', trimmedMessage);
-      showMessage('bot', cachedResponse.reply);
-      inputEl.value = '';
-      return;
-    }
-    
-    isTyping = true;
-    updateUI(true);
-    
-    showMessage('user', trimmedMessage);
-    const typingBubble = showMessage('bot', '', true);
-    
-    try {
-      const controller = new AbortController();
-      // Reduced timeout for faster failure detection
-      const timeoutId = setTimeout(() => controller.abort(), 18000);
-      
-      const response = await fetch('/api/chat', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'application/json',
-          'Connection': 'keep-alive'
-        },
-        body: JSON.stringify({ message: trimmedMessage }),
-        signal: controller.signal,
-        keepalive: true
-      });
-      
-      clearTimeout(timeoutId);
-      
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-      }
-      
-      const data = await response.json();
-      
-      removeTypingIndicator();
-      
-      if (data.ok && data.reply) {
-        showMessage('bot', data.reply);
-        
-        // Cache with shorter expiry
-        MESSAGE_CACHE.set(trimmedMessage.toLowerCase(), {
-          reply: data.reply,
-          timestamp: now
-        });
-        
-        // More aggressive cache size limit
-        if (MESSAGE_CACHE.size > 30) {
-          const firstKey = MESSAGE_CACHE.keys().next().value;
-          MESSAGE_CACHE.delete(firstKey);
+    // Xử lý nút xóa
+    clearBtn.addEventListener('click', async () => {
+        if (!confirm('Bạn có chắc muốn xóa toàn bộ lịch sử chat?')) return;
+        try {
+            await fetch('/api/clear', { method: 'POST' });
+            loadInitialHistory();
+        } catch (error) {
+            console.error('Error clearing history:', error);
         }
-        
-        updateStatus('🟢 Online', 'online');
-      } else {
-        showError(data.error || 'Không có phản hồi');
-      }
-      
-    } catch (error) {
-      removeTypingIndicator();
-      
-      if (error.name === 'AbortError') {
-        showError('⏱️ Server quá tải, thử lại');
-        updateStatus('🟡 Busy', 'offline');
-      } else {
-        const errorMsg = error.message.includes('fetch') 
-          ? '🔌 Mất kết nối' 
-          : `❌ ${error.message}`;
-        showError(errorMsg);
-        updateStatus('🔴 Offline', 'offline');
-      }
-    } finally {
-      isTyping = false;
-      updateUI(false);
-      inputEl.value = '';
-    }
-  }
-  
-  function showError(message) {
-    const errorDiv = document.createElement('div');
-    errorDiv.className = 'error-msg';
-    errorDiv.textContent = message;
-    
-    const retryBtn = document.createElement('button');
-    retryBtn.className = 'retry-btn';
-    retryBtn.textContent = 'Thử lại';
-    retryBtn.onclick = () => {
-      const lastUserMsg = [...messagesEl.querySelectorAll('.msg.user .bubble')]
-        .pop()?.textContent;
-      if (lastUserMsg) {
-        errorDiv.remove();
-        sendMessage(lastUserMsg);
-      }
-    };
-    
-    errorDiv.appendChild(retryBtn);
-    messagesEl.appendChild(errorDiv);
-    messagesEl.scrollTop = messagesEl.scrollHeight;
-    
-    // Auto remove after 10 seconds
-    setTimeout(() => errorDiv.remove(), 10000);
-  }
-  
-  function updateUI(disabled) {
-    inputEl.disabled = disabled;
-    sendBtn.disabled = disabled;
-    if (disabled) {
-      inputEl.placeholder = 'Đang xử lý...';
-    } else {
-      inputEl.placeholder = 'Nhập câu hỏi và nhấn Enter...';
-      inputEl.focus();
-    }
-  }
-  
-  // Event listeners
-  const debouncedSend = debounce(() => {
-    const message = inputEl.value.trim();
-    if (message) sendMessage(message);
-  }, DEBOUNCE_DELAY);
-  
-  sendBtn.addEventListener('click', debouncedSend);
-  
-  inputEl.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      debouncedSend();
-    }
-  });
-  
-  // Clear functionality
-  clearBtn.addEventListener('click', async () => {
-    if (!confirm('🗑️ Xóa tất cả lịch sử chat?')) return;
-    
-    try {
-      const response = await fetch('/api/clear', { method: 'POST' });
-      const data = await response.json();
-      
-      if (data.ok) {
-        messagesEl.innerHTML = '';
-        MESSAGE_CACHE.clear();
-        messageCount = 0;
-        updateMessageCount();
-        updateStatus('🟢 Cleared', 'online');
-        setTimeout(() => updateStatus('🟢 Online', 'online'), 2000);
-      } else {
-        alert('❌ Lỗi: ' + (data.error || 'Không rõ'));
-      }
-    } catch (error) {
-      alert('❌ Lỗi kết nối: ' + error.message);
-    }
-  });
-  
-  // Load chat history
-  async function loadHistory() {
-    try {
-      updateStatus('🔄 Loading...', 'offline');
-      
-      const response = await fetch('/api/history');
-      const data = await response.json();
-      
-      if (data.ok && Array.isArray(data.messages)) {
-        data.messages.forEach(msg => {
-          if (msg.role && msg.content) {
-            showMessage(msg.role === 'user' ? 'user' : 'bot', msg.content);
-          }
-        });
-        updateStatus('🟢 Online', 'online');
-      } else {
-        updateStatus('🟡 No history', 'online');
-      }
-    } catch (error) {
-      console.warn('History load failed:', error);
-      updateStatus('🔴 Offline', 'offline');
-    }
-  }
-  
-  // Check server status
-  async function checkStatus() {
-    try {
-      const response = await fetch('/api/status');
-      const data = await response.json();
-      if (data.ok) {
-        updateStatus('🟢 Online', 'online');
-        return true;
-      }
-    } catch (error) {
-      updateStatus('🔴 Offline', 'offline');
-    }
-    return false;
-  }
-  
-  // Ultra-fast initialization
-  async function init() {
-    // Update time immediately and every second
-    updateVietnamTime();
-    setInterval(updateVietnamTime, 1000);
-    
-    const isOnline = await checkStatus();
-    if (isOnline) {
-      await loadHistory();
-    }
-    inputEl.focus();
-    
-    // More frequent status check for faster error detection
-    setInterval(checkStatus, 20000);
-  }
-  
-  // Start the app
-  init();
-  
-  // Cleanup on page unload
-  window.addEventListener('beforeunload', () => {
-    MESSAGE_CACHE.clear();
-  });
-  
-})();
+    });
+
+    // Tải lịch sử ban đầu
+    loadInitialHistory();
 </script>
+
 </body>
 </html>
