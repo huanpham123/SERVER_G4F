@@ -1,6 +1,5 @@
-Flask
+flask
 flask-cors
-jinja2
+requests
 pytz
 g4f
-gunicorn
