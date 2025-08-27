@@ -1,372 +1,550 @@
-# index.py
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 import os
 import json
-import time
-import tempfile
-import logging
+import requests
+import asyncio
+import threading
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+from concurrent.futures import ThreadPoolExecutor
+import pytz
+from functools import lru_cache
+import time
+import logging
 
-from flask import Flask, request, jsonify, render_template
-from flask_cors import CORS
+# Disable all logging for maximum performance
+logging.basicConfig(level=logging.CRITICAL)
+logging.getLogger('werkzeug').setLevel(logging.CRITICAL)
 
-# Optional redis (Upstash). If not available, redis_client stays None.
-try:
-    import redis
-    REDIS_AVAILABLE = True
-except Exception:
-    redis = None
-    REDIS_AVAILABLE = False
+# Vietnam timezone
+VIETNAM_TZ = pytz.timezone('Asia/Ho_Chi_Minh')
 
-# Optional g4f client (your LLM client). If not available, llm client will raise.
-try:
-    from g4f.client import Client as G4FClient
-    G4F_AVAILABLE = True
-except Exception:
-    G4FClient = None
-    G4F_AVAILABLE = False
-
-# -----------------------
-# Config (env)
-# -----------------------
-HISTORY_KEY = os.environ.get("HISTORY_KEY", "chat_history_v1")
-HISTORY_FILE = os.environ.get("HISTORY_FILE", "/tmp/chat_history.json")  # ephemeral on serverless
-REDIS_URL = os.environ.get("REDIS_URL", "")  # Upstash-style URL if provided
+# Configuration for Vercel
+MAX_MESSAGES = 50  # Reduced for Vercel memory limits
 MODEL_NAME = os.environ.get("MODEL_NAME", "gpt-4o-mini")
-API_CALL_TIMEOUT = float(os.environ.get("API_CALL_TIMEOUT", "12.0"))  # seconds
-MAX_HISTORY = int(os.environ.get("MAX_HISTORY", "120"))
-MAX_INPUT_MESSAGES = int(os.environ.get("MAX_INPUT_MESSAGES", "3"))
-CACHE_TTL = int(os.environ.get("CACHE_TTL", "180"))  # seconds for identical query cache
+API_TIMEOUT = 10.0  # Aggressive timeout for Vercel
 
-# -----------------------
-# Setup logging
-# -----------------------
-logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger("fastchat")
-logger.setLevel(logging.INFO)
+# External storage URL for chat history (use your own)
+STORAGE_API_URL = os.environ.get("STORAGE_API_URL", "")
+STORAGE_API_KEY = os.environ.get("STORAGE_API_KEY", "")
 
-# -----------------------
-# Redis client (optional)
-# -----------------------
-redis_client = None
-if REDIS_URL and REDIS_AVAILABLE:
-    try:
-        # support both redis:// and upstash-style
-        redis_client = redis.from_url(REDIS_URL, decode_responses=True)
-        # quick ping
-        redis_client.ping()
-        logger.info("Connected to Redis")
-    except Exception as e:
-        logger.warning("Redis not available: %s", e)
-        redis_client = None
+# Thread pool with minimal workers for Vercel
+executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="chat")
 
-# -----------------------
-# LLM wrapper + thread executor
-# -----------------------
-executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="llm")
+# Ultra-lightweight Flask app
+app = Flask(__name__)
+app.logger.disabled = True
 
-class LLMWrapper:
+# Minimal CORS
+CORS(app, resources={
+    r"/api/*": {
+        "origins": "*",
+        "methods": ["GET", "POST"],
+        "allow_headers": ["Content-Type"]
+    }
+})
+
+class VercelChatBot:
+    _instance = None
+    _lock = threading.Lock()
+    
+    def __new__(cls):
+        if not cls._instance:
+            with cls._lock:
+                if not cls._instance:
+                    cls._instance = super().__new__(cls)
+        return cls._instance
+    
     def __init__(self):
-        if not G4F_AVAILABLE:
-            logger.warning("g4f client not available; LLM calls will fail unless installed.")
-        self.client = G4FClient() if G4F_AVAILABLE else None
+        if hasattr(self, 'initialized'):
+            return
+            
+        self.messages = []
+        self._cache = {}
+        self._last_request_time = 0
+        self._vietnam_tz = VIETNAM_TZ
+        
+        # Load history from external storage if available
+        self._load_external_history()
+        self.initialized = True
 
-    def call(self, messages, timeout=API_CALL_TIMEOUT):
-        """
-        Blocking call to LLM. Designed to run in thread executor.
-        Returns reply string or raises.
-        """
-        if not self.client:
-            raise RuntimeError("LLM client not installed/available.")
+    @lru_cache(maxsize=1)
+    def get_vietnam_time(self):
+        """Get current Vietnam time - cached for performance"""
+        vn_time = datetime.now(self._vietnam_tz)
+        return {
+            'time': vn_time.strftime('%H:%M:%S'),
+            'date': vn_time.strftime('%d/%m/%Y'),
+            'weekday': ['Thứ Hai', 'Thứ Ba', 'Thứ Tư', 'Thứ Năm', 'Thứ Sáu', 'Thứ Bảy', 'Chủ Nhật'][vn_time.weekday()],
+            'full': f"{vn_time.strftime('%H:%M:%S')} - {vn_time.strftime('%d/%m/%Y')}",
+            'location': 'Khánh Hòa, Việt Nam'
+        }
 
-        def _call():
-            # Defensive wrapper around g4f usage
-            resp = self.client.chat.completions.create(
-                model=MODEL_NAME,
-                messages=messages,
-                max_tokens=800,
-                temperature=0.5,
-                top_p=0.9
+    def _load_external_history(self):
+        """Load chat history from external storage"""
+        if not STORAGE_API_URL:
+            return
+            
+        try:
+            response = requests.get(
+                f"{STORAGE_API_URL}/history",
+                headers={"Authorization": f"Bearer {STORAGE_API_KEY}"},
+                timeout=3
             )
-            # Try to extract the common structure
-            try:
-                return resp.choices[0].message.content.strip()
-            except Exception:
-                # fallback to string
-                return str(resp).strip()
-
-        fut = executor.submit(_call)
-        try:
-            return fut.result(timeout=timeout)
-        except FuturesTimeout:
-            fut.cancel()
-            raise TimeoutError("LLM call timed out")
-        except Exception as e:
-            raise
-
-llm = LLMWrapper()
-
-# -----------------------
-# Utility: history and cache management
-# -----------------------
-def _local_save_history(history):
-    try:
-        dirpath = os.path.dirname(HISTORY_FILE) or "/tmp"
-        with tempfile.NamedTemporaryFile("w", dir=dirpath, delete=False, encoding="utf-8") as tf:
-            json.dump(history[-MAX_HISTORY:], tf, ensure_ascii=False, separators=(",", ":"))
-            tmpname = tf.name
-        os.replace(tmpname, HISTORY_FILE)
-        return True
-    except Exception as e:
-        logger.warning("Local save history failed: %s", e)
-        return False
-
-def _local_load_history():
-    try:
-        if os.path.exists(HISTORY_FILE):
-            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-                content = f.read().strip()
-                if content:
-                    data = json.loads(content)
-                    return data[-MAX_HISTORY:]
-    except Exception as e:
-        logger.warning("Local load history failed: %s", e)
-    return []
-
-def _redis_set_history(history):
-    if not redis_client:
-        return False
-    try:
-        redis_client.set(HISTORY_KEY, json.dumps(history[-MAX_HISTORY:], ensure_ascii=False), ex=None)
-        return True
-    except Exception as e:
-        logger.warning("Redis set history failed: %s", e)
-        return False
-
-def _redis_get_history():
-    if not redis_client:
-        return None
-    try:
-        v = redis_client.get(HISTORY_KEY)
-        if v:
-            return json.loads(v)
-    except Exception as e:
-        logger.warning("Redis get history failed: %s", e)
-    return None
-
-def save_history_async(history):
-    """Non-blocking save (background via executor)"""
-    def _save():
-        if redis_client:
-            ok = _redis_set_history(history)
-            if ok:
-                return
-        _local_save_history(history)
-    try:
-        executor.submit(_save)
-    except Exception:
-        _save()
-
-def load_history():
-    if redis_client:
-        v = _redis_get_history()
-        if v is not None:
-            return v
-    return _local_load_history()
-
-# simple cache for identical messages (in-Redis if available)
-def get_cached_reply(key_hash):
-    if redis_client:
-        try:
-            return redis_client.get(key_hash)
-        except Exception:
-            return None
-    return None
-
-def set_cached_reply(key_hash, reply):
-    if redis_client:
-        try:
-            redis_client.set(key_hash, reply, ex=CACHE_TTL)
-        except Exception:
+            if response.status_code == 200:
+                data = response.json()
+                self.messages = data.get('messages', [])[-MAX_MESSAGES:]
+        except:
             pass
 
-# -----------------------
-# Helpers: payload & fallback
-# -----------------------
-def system_prompt_with_time():
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    return {"role": "system", "content": f"Bạn là một trợ lý AI. Time (UTC+7): {now}"}
-
-def build_payload(history, user_input):
-    system_msgs = [m for m in history if m.get("role") == "system"]
-    conv = [m for m in history if m.get("role") in ("user", "assistant")]
-    recent = conv[-MAX_INPUT_MESSAGES:] if conv else []
-    payload = []
-    if system_msgs:
-        payload.extend([{"role":m["role"], "content":m["content"]} for m in system_msgs])
-    else:
-        payload.append(system_prompt_with_time())
-    for m in recent:
-        payload.append({"role": m["role"], "content": m["content"]})
-    payload.append({"role": "user", "content": user_input})
-    return payload
-
-def fallback_reply(user_input):
-    # Avoid the specific phrase "Hệ thống đang bận"
-    u = user_input.strip()
-    if not u:
-        return "Bạn chưa nhập gì. Vui lòng nhập câu hỏi."
-    if len(u) < 60:
-        return "Mình nhận được câu hỏi của bạn — hiện tạm trả lời ngắn: hãy hỏi thêm chi tiết để được trả lời đầy đủ."
-    return "Xin lỗi, hiện chưa thể trả lời đầy đủ. Vui lòng thử hỏi ngắn hơn hoặc thử lại."
-
-# -----------------------
-# Flask app
-# -----------------------
-app = Flask(__name__, template_folder="templates")
-CORS(app, resources={r"/api/*": {"origins": "*"}})
-
-# quick health root -> sv.html
-@app.route("/")
-def index():
-    try:
-        return render_template("sv.html")
-    except Exception:
-        return "<h2>Template sv.html not found in templates/</h2>", 404
-
-# Chat endpoint
-@app.route("/api/chat", methods=["POST"])
-def api_chat():
-    try:
-        data = request.get_json(force=True, silent=True)
-        if not data:
-            return jsonify({"ok": False, "error": "Invalid JSON"}), 400
-        message = (data.get("message") or "").strip()
-        if not message:
-            return jsonify({"ok": False, "error": "Empty message"}), 400
-        if len(message) > 5000:
-            return jsonify({"ok": False, "error": "Message too long"}), 400
-
-        # quick commands
-        if message.lower() in ("clear", "/clear", "xóa", "xoa"):
-            # clear both local and redis
-            if os.path.exists(HISTORY_FILE):
-                try:
-                    os.remove(HISTORY_FILE)
-                except:
-                    pass
-            if redis_client:
-                try:
-                    redis_client.delete(HISTORY_KEY)
-                except:
-                    pass
-            return jsonify({"ok": True, "reply": "Đã xóa lịch sử chat."})
-
-        # load history
-        history = load_history() or []
-
-        # cache check (hash key)
-        cache_key = f"cache:reply:{hash(message)}"
-        cached = get_cached_reply(cache_key)
-        if cached:
-            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            history.append({"role":"user","content":message,"timestamp":ts})
-            history.append({"role":"assistant","content":cached,"timestamp":ts})
-            save_history_async(history)
-            return jsonify({"ok": True, "reply": cached})
-
-        # Build payload
-        payload = build_payload(history, message)
-
-        # call LLM in thread with timeout
-        try:
-            # we run blocking call in separate thread to allow timeout
-            future = executor.submit(lambda: llm.call(payload, timeout=API_CALL_TIMEOUT))
-            reply = future.result(timeout=API_CALL_TIMEOUT + 1.0)  # small margin
-            if not reply or len(reply.strip()) < 2:
-                reply = fallback_reply(message)
-        except FuturesTimeout:
-            # cancel and fallback
+    def _save_external_history(self):
+        """Save to external storage (non-blocking)"""
+        if not STORAGE_API_URL:
+            return
+            
+        def save_async():
             try:
-                future.cancel()
+                requests.post(
+                    f"{STORAGE_API_URL}/history",
+                    json={"messages": self.messages[-MAX_MESSAGES:]},
+                    headers={"Authorization": f"Bearer {STORAGE_API_KEY}"},
+                    timeout=2
+                )
             except:
                 pass
-            reply = fallback_reply(message)
-        except TimeoutError:
-            reply = fallback_reply(message)
-        except Exception as e:
-            logger.warning("LLM call exception: %s", e)
-            reply = fallback_reply(message)
+        
+        executor.submit(save_async)
 
-        # persist reply to history (non-blocking)
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        history.append({"role":"user","content":message,"timestamp":ts})
-        history.append({"role":"assistant","content":reply,"timestamp":ts})
-        if len(history) > MAX_HISTORY:
-            history = history[-MAX_HISTORY:]
-        save_history_async(history)
+    def get_system_prompt(self):
+        """Dynamic system prompt with Vietnam time"""
+        time_info = self.get_vietnam_time()
+        return f"""Bạn là trợ lý AI thông minh và hữu ích ở Khánh Hòa, Việt Nam.
 
-        # cache short-lived if redis present
-        if redis_client:
+THÔNG TIN THỜI GIAN HIỆN TẠI:
+- Thời gian: {time_info['time']} (UTC+7)
+- Ngày: {time_info['date']}
+- Thứ: {time_info['weekday']}
+- Địa điểm: {time_info['location']}
+
+Hãy trả lời ngắn gọn, chính xác và thân thiện. Khi được hỏi về thời gian, sử dụng thông tin trên."""
+
+    def manage_memory(self):
+        """Aggressive memory management for Vercel"""
+        if len(self.messages) > MAX_MESSAGES:
+            # Keep only system messages and recent conversations
+            system_msgs = [m for m in self.messages if m.get("role") == "system"]
+            recent_msgs = [m for m in self.messages if m.get("role") != "system"][-30:]
+            self.messages = system_msgs + recent_msgs
+            self._cache.clear()
+
+    def get_response_fast(self, user_input):
+        """Ultra-fast response optimized for Vercel"""
+        start_time = time.time()
+        
+        # Rate limiting
+        if time.time() - self._last_request_time < 0.5:
+            return "Vui lòng chờ một chút trước khi gửi tin nhắn tiếp theo."
+        
+        self._last_request_time = time.time()
+        
+        try:
+            # Check for time-related queries first
+            time_keywords = ["giờ", "thời gian", "ngày", "tháng", "năm", "bây giờ", "hiện tại"]
+            if any(keyword in user_input.lower() for keyword in time_keywords):
+                time_info = self.get_vietnam_time()
+                reply = f"Hiện tại là {time_info['full']} tại {time_info['location']}."
+                
+                # Add to history
+                timestamp = datetime.now(self._vietnam_tz).isoformat()
+                self.messages.extend([
+                    {"role": "user", "content": user_input, "timestamp": timestamp},
+                    {"role": "assistant", "content": reply, "timestamp": timestamp}
+                ])
+                
+                self._save_external_history()
+                return reply
+
+            # Build minimal context for API call
+            system_prompt = self.get_system_prompt()
+            
+            # Only use last 3 messages for context to minimize API call size
+            recent_context = []
+            if self.messages:
+                recent_msgs = [m for m in self.messages if m.get("role") in ["user", "assistant"]][-3:]
+                recent_context = [{"role": m["role"], "content": m["content"]} for m in recent_msgs]
+            
+            # Construct minimal API payload
+            api_messages = [{"role": "system", "content": system_prompt}] + recent_context + [{"role": "user", "content": user_input}]
+            
+            # Use g4f for free API calls
             try:
-                redis_client.set(cache_key, reply, ex=CACHE_TTL)
-            except Exception:
+                from g4f.client import Client
+                client = Client()
+                
+                response = client.chat.completions.create(
+                    model=MODEL_NAME,
+                    messages=api_messages,
+                    max_tokens=500,  # Reduced for speed
+                    temperature=0.7,
+                    timeout=API_TIMEOUT
+                )
+                
+                bot_reply = response.choices[0].message.content.strip()
+                
+            except Exception as api_error:
+                # Fallback to simple response if API fails
+                bot_reply = "Xin lỗi, tôi đang gặp sự cố kỹ thuật. Vui lòng thử lại sau."
+            
+            if not bot_reply or len(bot_reply) < 3:
+                bot_reply = "Tôi chưa hiểu rõ câu hỏi. Bạn có thể hỏi lại được không?"
+            
+            # Add to history with timestamp
+            timestamp = datetime.now(self._vietnam_tz).isoformat()
+            self.messages.extend([
+                {"role": "user", "content": user_input, "timestamp": timestamp},
+                {"role": "assistant", "content": bot_reply, "timestamp": timestamp}
+            ])
+            
+            # Memory management
+            self.manage_memory()
+            
+            # Save to external storage (non-blocking)
+            self._save_external_history()
+            
+            # Log slow responses
+            response_time = time.time() - start_time
+            if response_time > 8:
+                print(f"Slow response: {response_time:.2f}s")
+            
+            return bot_reply
+            
+        except Exception as e:
+            # Always save user message even if response fails
+            try:
+                timestamp = datetime.now(self._vietnam_tz).isoformat()
+                self.messages.append({
+                    "role": "user", 
+                    "content": user_input, 
+                    "timestamp": timestamp
+                })
+            except:
                 pass
+            
+            return "Hệ thống đang bận, vui lòng thử lại sau."
 
+    def clear_history(self):
+        """Clear all chat history"""
+        self.messages = []
+        self._cache.clear()
+        
+        # Clear external storage too
+        if STORAGE_API_URL:
+            def clear_async():
+                try:
+                    requests.delete(
+                        f"{STORAGE_API_URL}/history",
+                        headers={"Authorization": f"Bearer {STORAGE_API_KEY}"},
+                        timeout=2
+                    )
+                except:
+                    pass
+            
+            executor.submit(clear_async)
+
+# Global bot instance
+bot = VercelChatBot()
+
+# API Routes optimized for Vercel
+
+@app.route("/")
+def index():
+    """Serve the main HTML page"""
+    html_content = '''<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>⚡ Vercel Chatbot</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { 
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; 
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      min-height: 100vh; display: flex; align-items: center; justify-content: center;
+      padding: 16px;
+    }
+    .container { 
+      width: 100%; max-width: 800px; 
+      background: rgba(255,255,255,0.95); backdrop-filter: blur(10px);
+      border-radius: 20px; box-shadow: 0 20px 40px rgba(0,0,0,0.1); 
+      padding: 24px; border: 1px solid rgba(255,255,255,0.2);
+    }
+    .header { text-align: center; margin-bottom: 20px; }
+    .header h1 { color: #2d3748; font-size: 24px; font-weight: 700; margin-bottom: 8px; }
+    .status { 
+      display: inline-block; padding: 4px 12px; border-radius: 12px; 
+      font-size: 12px; font-weight: 600; background: #c6f6d5; color: #22543d;
+    }
+    .chat { 
+      height: 400px; overflow-y: auto; border: 1px solid #e2e8f0; 
+      border-radius: 16px; padding: 16px; margin-bottom: 20px;
+      background: linear-gradient(to bottom, #f7fafc, #edf2f7);
+    }
+    .message { margin: 12px 0; animation: fadeIn 0.3s ease-out; }
+    .message.user { text-align: right; }
+    .message.bot { text-align: left; }
+    .bubble { 
+      display: inline-block; padding: 12px 16px; border-radius: 18px; 
+      max-width: 80%; white-space: pre-wrap; word-wrap: break-word;
+    }
+    .bubble.user { 
+      background: linear-gradient(135deg, #4299e1, #3182ce); color: white; 
+      box-shadow: 0 4px 12px rgba(66, 153, 225, 0.3);
+    }
+    .bubble.bot { 
+      background: white; color: #2d3748; border: 1px solid #e2e8f0;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+    }
+    .bubble.typing { background: #f7fafc; border: 1px dashed #cbd5e0; }
+    .controls { display: flex; gap: 12px; }
+    .input-group { flex: 1; position: relative; }
+    input { 
+      width: 100%; padding: 14px 50px 14px 16px; border-radius: 25px; 
+      border: 2px solid #e2e8f0; outline: none; transition: all 0.2s;
+    }
+    input:focus { border-color: #4299e1; box-shadow: 0 0 0 3px rgba(66, 153, 225, 0.1); }
+    .send-btn {
+      position: absolute; right: 8px; top: 50%; transform: translateY(-50%);
+      background: linear-gradient(135deg, #48bb78, #38a169); border: none; 
+      border-radius: 50%; width: 36px; height: 36px; cursor: pointer; 
+      color: white; display: flex; align-items: center; justify-content: center;
+    }
+    .send-btn:hover { transform: translateY(-50%) scale(1.1); }
+    .clear-btn { 
+      padding: 12px 20px; border-radius: 25px; border: none; cursor: pointer; 
+      background: #fed7d7; color: #c53030; font-weight: 600;
+    }
+    .clear-btn:hover { background: #fc8181; color: white; }
+    .typing { animation: pulse 1.5s infinite; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+    @keyframes pulse { 0%, 100% { opacity: 0.7; } 50% { opacity: 1; } }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>⚡ Vercel AI Chatbot</h1>
+      <div class="status">🟢 Online</div>
+    </div>
+    
+    <div class="chat" id="chat"></div>
+    
+    <div class="controls">
+      <div class="input-group">
+        <input id="input" placeholder="Nhập câu hỏi và nhấn Enter..." maxlength="1000">
+        <button class="send-btn" id="send">➤</button>
+      </div>
+      <button class="clear-btn" id="clear">🗑️ Xóa</button>
+    </div>
+  </div>
+
+  <script>
+    const chat = document.getElementById('chat');
+    const input = document.getElementById('input');
+    const sendBtn = document.getElementById('send');
+    const clearBtn = document.getElementById('clear');
+    
+    let isTyping = false;
+    
+    function addMessage(role, text, isTemp = false) {
+      const div = document.createElement('div');
+      div.className = `message ${role}`;
+      
+      const bubble = document.createElement('div');
+      bubble.className = `bubble ${role} ${isTemp ? 'typing' : ''}`;
+      bubble.textContent = isTemp ? 'Đang xử lý...' : text;
+      
+      div.appendChild(bubble);
+      chat.appendChild(div);
+      chat.scrollTop = chat.scrollHeight;
+      
+      return bubble;
+    }
+    
+    function removeTyping() {
+      const typing = chat.querySelectorAll('.bubble.typing');
+      typing.forEach(el => el.parentElement.remove());
+    }
+    
+    async function sendMessage() {
+      if (isTyping || !input.value.trim()) return;
+      
+      const message = input.value.trim();
+      input.value = '';
+      
+      addMessage('user', message);
+      
+      isTyping = true;
+      sendBtn.disabled = true;
+      input.disabled = true;
+      
+      const typingBubble = addMessage('bot', '', true);
+      
+      try {
+        const response = await fetch('/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message })
+        });
+        
+        const data = await response.json();
+        
+        removeTyping();
+        
+        if (data.ok) {
+          addMessage('bot', data.reply);
+        } else {
+          addMessage('bot', data.error || 'Lỗi không xác định');
+        }
+        
+      } catch (error) {
+        removeTyping();
+        addMessage('bot', 'Lỗi kết nối. Vui lòng thử lại.');
+      }
+      
+      isTyping = false;
+      sendBtn.disabled = false;
+      input.disabled = false;
+      input.focus();
+    }
+    
+    async function clearChat() {
+      if (!confirm('Xóa toàn bộ lịch sử chat?')) return;
+      
+      try {
+        const response = await fetch('/api/clear', { method: 'POST' });
+        const data = await response.json();
+        
+        if (data.ok) {
+          chat.innerHTML = '';
+        }
+      } catch (error) {
+        alert('Lỗi xóa chat');
+      }
+    }
+    
+    sendBtn.onclick = sendMessage;
+    clearBtn.onclick = clearChat;
+    
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        sendMessage();
+      }
+    });
+    
+    // Load history
+    async function loadHistory() {
+      try {
+        const response = await fetch('/api/history');
+        const data = await response.json();
+        
+        if (data.ok && data.messages) {
+          data.messages.forEach(msg => {
+            if (msg.role && msg.content) {
+              addMessage(msg.role === 'user' ? 'user' : 'bot', msg.content);
+            }
+          });
+        }
+      } catch (error) {
+        console.warn('Could not load history');
+      }
+    }
+    
+    loadHistory();
+    input.focus();
+  </script>
+</body>
+</html>'''
+    return html_content
+
+@app.route("/api/chat", methods=["POST"])
+def api_chat():
+    """Main chat endpoint - ultra-fast response"""
+    try:
+        data = request.get_json(force=True)
+        if not data or not data.get("message"):
+            return jsonify({"ok": False, "error": "Invalid request"}), 400
+            
+        message = data["message"].strip()
+        
+        if not message or len(message) > 1000:
+            return jsonify({"ok": False, "error": "Invalid message length"}), 400
+        
+        # Handle clear command
+        if message.lower() in ["clear", "/clear", "xóa", "xoa"]:
+            bot.clear_history()
+            return jsonify({"ok": True, "reply": "Đã xóa lịch sử chat."})
+        
+        # Get AI response
+        reply = bot.get_response_fast(message)
         return jsonify({"ok": True, "reply": reply})
+        
     except Exception as e:
-        logger.exception("api_chat error")
-        # fallback safe reply (do not return the "Hệ thống đang bận" phrase)
-        reply = fallback_reply("")
-        return jsonify({"ok": True, "reply": reply, "info": "fallback_due_to_error"})
+        return jsonify({"ok": False, "error": "Server busy"}), 500
 
 @app.route("/api/history", methods=["GET"])
 def api_history():
+    """Get chat history"""
     try:
-        history = load_history() or []
-        return jsonify({"ok": True, "messages": history[-50:]})
-    except Exception:
+        # Return only last 20 messages for speed
+        recent = bot.messages[-20:] if bot.messages else []
+        return jsonify({"ok": True, "messages": recent})
+    except:
         return jsonify({"ok": True, "messages": []})
 
-@app.route("/api/clear", methods=["POST"])
+@app.route("/api/clear", methods=["POST"])  
 def api_clear():
+    """Clear chat history"""
     try:
-        if os.path.exists(HISTORY_FILE):
-            try:
-                os.remove(HISTORY_FILE)
-            except:
-                pass
-        if redis_client:
-            try:
-                redis_client.delete(HISTORY_KEY)
-            except:
-                pass
-        return jsonify({"ok": True, "message": "Cleared"})
-    except Exception:
-        return jsonify({"ok": False, "error": "Error clearing"}), 500
+        bot.clear_history()
+        return jsonify({"ok": True})
+    except:
+        return jsonify({"ok": False, "error": "Error"}), 500
 
 @app.route("/api/status", methods=["GET"])
 def api_status():
+    """Server status"""
     try:
-        redis_ok = False
-        if redis_client:
-            try:
-                redis_client.ping()
-                redis_ok = True
-            except:
-                redis_ok = False
+        time_info = bot.get_vietnam_time()
         return jsonify({
             "ok": True,
-            "status": "online",
-            "model": MODEL_NAME,
-            "redis": redis_ok,
-            "api_call_timeout": API_CALL_TIMEOUT
+            "status": "online", 
+            "time": time_info['full'],
+            "location": time_info['location'],
+            "messages": len(bot.messages)
         })
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+    except:
+        return jsonify({"ok": True, "status": "online"})
 
-# Local dev
+@app.route("/api/time", methods=["GET"])
+def api_time():
+    """Vietnam time endpoint"""
+    try:
+        time_info = bot.get_vietnam_time()
+        return jsonify({"ok": True, "time_info": time_info})
+    except:
+        return jsonify({"ok": False, "error": "Time error"}), 500
+
+# Error handlers
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({"ok": False, "error": "Not found"}), 404
+
+@app.errorhandler(500)
+def server_error(error):
+    return jsonify({"ok": False, "error": "Server error"}), 500
+
+# Vercel entry point
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    # threaded True to allow concurrent requests in dev; Vercel serverless will handle concurrency separately
-    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
+    app.run(debug=False)
