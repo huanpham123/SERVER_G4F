@@ -1,19 +1,15 @@
+# app.py
+import os
+import time
+import threading
+import logging
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+from functools import wraps
 from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
-import os
-import json
-import threading
-import time
-from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
-from functools import lru_cache, wraps
-import tempfile
-import logging
-import pytz
 import requests
-
-# If you use g4f, keep import dynamic inside class to avoid import-time failures on deploy
-# from g4f.client import Client
+import pytz
 
 # ---------- Config ----------
 VIETNAM_TZ = pytz.timezone(os.getenv("VIETNAM_TZ", "Asia/Ho_Chi_Minh"))
@@ -21,29 +17,25 @@ VIETNAM_TZ = pytz.timezone(os.getenv("VIETNAM_TZ", "Asia/Ho_Chi_Minh"))
 MAX_MESSAGES = int(os.getenv("MAX_MESSAGES", 80))
 MAX_INPUT_MESSAGES = int(os.getenv("MAX_INPUT_MESSAGES", 3))
 MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o-mini")
-API_CALL_TIMEOUT = float(os.getenv("API_CALL_TIMEOUT", 15.0))
-
-# URL to POST history to (example: https://webhook.site/xxxx or Beeceptor URL or JSONBin endpoint)
-STORAGE_API_URL = os.getenv("STORAGE_API_URL", "").rstrip("/")  # no trailing slash
+API_CALL_TIMEOUT = float(os.getenv("API_CALL_TIMEOUT", 10.0))
+STORAGE_API_URL = os.getenv("STORAGE_API_URL", "").rstrip("/")
 STORAGE_API_KEY = os.getenv("STORAGE_API_KEY", "")
-
-# Control how often we attempt to push history externally
 SAVE_INTERVAL = float(os.getenv("SAVE_INTERVAL", "3.0"))
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")  # optional fallback
 
-# Thread pool for async background tasks
+# Thread pool
 executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="chatbot")
 
 # Logging
-logging.basicConfig(level=logging.WARNING, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("ultrafast")
-logger.setLevel(logging.WARNING)
+logger.setLevel(logging.INFO)
 
 # Flask app
 app = Flask(__name__, template_folder="templates", static_folder="static")
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 app.logger.disabled = True
 
-# Helper decorator to run function in background
 def async_task(func):
     @wraps(func)
     def wrapper(*args, **kwargs):
@@ -65,25 +57,30 @@ class UltraFastChatBot:
         if getattr(self, "initialized", False):
             return
 
-        # lazy Client import to avoid import-time failures
+        # Attempt lazy client setup (do not fail on import error)
+        self._client_available = False
+        self.g4f_client = None
         try:
-            from g4f.client import Client
+            # dynamic import: may fail on Vercel if package not present
+            from g4f.client import Client as G4FClient
+            self.g4f_client = G4FClient()
             self._client_available = True
-            self.client = Client()
+            logger.info("g4f client loaded")
         except Exception:
-            self._client_available = False
-            self.client = None
+            logger.info("g4f not available; will try OpenAI if OPENAI_API_KEY provided")
 
         self.max_messages = max_messages
-        self.messages = []  # in-memory store: list of {"role","content","timestamp"}
-        self._message_cache = {}
+        self.messages = []
         self._last_save_time = 0.0
         self._save_interval = SAVE_INTERVAL
         self._lock = threading.RLock()
         self._vietnam_tz = VIETNAM_TZ
 
-        # Try to preload history from external URL (best-effort)
-        self._load_history_external()
+        # try to preload from external storage (best-effort)
+        try:
+            self._load_history_external()
+        except Exception:
+            pass
 
         self.initialized = True
 
@@ -116,14 +113,11 @@ class UltraFastChatBot:
     def clear_history(self):
         with self._lock:
             self.messages = []
-            self._message_cache.clear()
-        # optionally tell external store to clear (best-effort)
         if STORAGE_API_URL:
             try:
                 headers = {}
                 if STORAGE_API_KEY:
                     headers["Authorization"] = f"Bearer {STORAGE_API_KEY}"
-                # Many simple webhook endpoints won't accept DELETE; best-effort
                 executor.submit(lambda: requests.delete(STORAGE_API_URL, headers=headers, timeout=2))
             except Exception:
                 pass
@@ -136,16 +130,13 @@ class UltraFastChatBot:
         return payload
 
     def add_system_with_time(self):
-        # remove old system messages and insert fresh one
         with self._lock:
             self.messages = [m for m in self.messages if m.get("role") != "system"]
             time_info = self.get_vietnam_time_info()
             system_content = f"Bạn là trợ lý AI tại {time_info['location']}. Thời gian hiện tại: {time_info['full_datetime']}."
             self.messages.insert(0, {"role":"system","content":system_content,"timestamp": self._now_ts()})
 
-    # --- External storage interactions (best-effort) ---
     def _load_history_external(self):
-        """Try to GET existing history from STORAGE_API_URL (if it supports GET). Best-effort only."""
         if not STORAGE_API_URL:
             return
         try:
@@ -157,44 +148,33 @@ class UltraFastChatBot:
                 try:
                     data = r.json()
                     if isinstance(data, dict) and "messages" in data and isinstance(data["messages"], list):
-                        # load only last max_messages
                         with self._lock:
                             self.messages = data["messages"][-self.max_messages:]
+                    elif isinstance(data, list):
+                        with self._lock:
+                            self.messages = data[-self.max_messages:]
                 except Exception:
-                    # if response is raw array
-                    try:
-                        data = r.json()
-                        if isinstance(data, list):
-                            with self._lock:
-                                self.messages = data[-self.max_messages:]
-                    except Exception:
-                        pass
+                    pass
         except Exception:
             pass
 
     @async_task
     def save_history_async(self, force=False):
-        """Push latest history to external URL (POST) non-blocking. Use short timeout."""
         current = time.time()
         if not force and (current - self._last_save_time) < self._save_interval:
             return
         with self._lock:
             try:
-                # trim aggressively before sending
                 if len(self.messages) > self.max_messages:
                     self._trim_messages()
-
                 payload = {"messages": self.messages[-self.max_messages:]}
                 headers = {"Content-Type": "application/json"}
                 if STORAGE_API_KEY:
                     headers["Authorization"] = f"Bearer {STORAGE_API_KEY}"
-
                 if STORAGE_API_URL:
-                    # POST to STORAGE_API_URL (best-effort, short timeout)
                     try:
                         requests.post(STORAGE_API_URL, json=payload, headers=headers, timeout=2)
                     except Exception:
-                        # try fallback: post to STORAGE_API_URL + /history if some endpoints expect path
                         try:
                             requests.post(f"{STORAGE_API_URL.rstrip('/')}/history", json=payload, headers=headers, timeout=2)
                         except Exception:
@@ -203,48 +183,107 @@ class UltraFastChatBot:
             except Exception:
                 pass
 
-    # --- Core LLM call (ultra-minimal payload) ---
+    def _call_openai_rest(self, payload_messages):
+        if not OPENAI_API_KEY:
+            return None
+        try:
+            url = "https://api.openai.com/v1/chat/completions"
+            body = {
+                "model": MODEL_NAME,
+                "messages": payload_messages,
+                "max_tokens": 600,
+                "temperature": 0.5,
+                "top_p": 0.9
+            }
+            headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+            r = requests.post(url, json=body, headers=headers, timeout=max(3, API_CALL_TIMEOUT))
+            if r.status_code == 200:
+                data = r.json()
+                # defensive checks
+                if "choices" in data and len(data["choices"]) > 0:
+                    msg = data["choices"][0].get("message", {}).get("content")
+                    if msg:
+                        return msg.strip()
+                # sometimes older completions schema:
+                text = data.get("choices", [{}])[0].get("text")
+                if text:
+                    return text.strip()
+            else:
+                logger.warning(f"OpenAI REST returned {r.status_code}: {r.text}")
+        except Exception as e:
+            logger.exception("OpenAI REST call failed")
+        return None
+
+    def _call_g4f(self, payload_messages):
+        # if g4f available, try it but never crash
+        if not self._client_available or not self.g4f_client:
+            return None
+        try:
+            # adapt to g4f client's expected input if needed
+            response = self.g4f_client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=payload_messages,
+                max_tokens=600,
+                temperature=0.5,
+                top_p=0.9,
+                timeout=API_CALL_TIMEOUT
+            )
+            try:
+                return response.choices[0].message.content.strip()
+            except Exception:
+                return str(response).strip()
+        except Exception:
+            logger.exception("g4f client call failed")
+            return None
+
+    def _call_llm(self, user_input):
+        payload_messages = self._build_minimal_payload(user_input)
+
+        # 1) try g4f if loaded
+        result = self._call_g4f(payload_messages)
+        if result and len(result) > 1:
+            return result
+
+        # 2) try OpenAI REST if API key is present
+        result = self._call_openai_rest(payload_messages)
+        if result and len(result) > 1:
+            return result
+
+        # 3) fallback (no external LLM available) -> give a helpful canned response
+        time_info = self.get_vietnam_time_info()
+        fallback = (
+            "Mình tạm thời không kết nối được mô-đun trả lời nhanh bên ngoài.\n"
+            f"Hiện tại là {time_info['full_datetime']} tại {time_info['location']}.\n"
+            "Bạn có thể thử hỏi lại câu khác hoặc kiểm tra biến môi trường OPENAI_API_KEY / g4f."
+        )
+        return fallback
+
     def get_response_ultra_fast(self, user_input):
         start = time.time()
         try:
-            # ensure system msg exists
             if not any(m.get("role") == "system" for m in self.messages) or len(self.messages) % 5 == 0:
                 self.add_system_with_time()
 
-            payload_messages = self._build_minimal_payload(user_input)
-
-            bot_reply = None
-            # call g4f if available, else fallback
-            if self._client_available and self.client:
-                try:
-                    response = self.client.chat.completions.create(
-                        model=MODEL_NAME,
-                        messages=payload_messages,
-                        max_tokens=600,
-                        temperature=0.5,
-                        top_p=0.9,
-                        timeout=API_CALL_TIMEOUT
-                    )
-                    try:
-                        bot_reply = response.choices[0].message.content.strip()
-                    except Exception:
-                        bot_reply = str(response).strip()
-                except Exception:
-                    bot_reply = None
+            # call LLM (synchronous; protected)
+            try:
+                bot_reply = self._call_llm(user_input)
+            except Exception:
+                bot_reply = None
 
             if not bot_reply or len(bot_reply) < 2:
-                bot_reply = "Xin lỗi, hiện tại tôi không truy cập được mô-đun trả lời nhanh. Bạn có thể thử lại hoặc chờ một chút."
+                bot_reply = (
+                    "Mình tạm thời không tạo được câu trả lời từ mô-đun bên ngoài. "
+                    "Vui lòng kiểm tra cấu hình hoặc thử lại sau ít phút."
+                )
 
-            # append into history
             ts = self._now_ts()
             with self._lock:
                 self.messages.append({"role":"user","content":user_input,"timestamp":ts})
                 self.messages.append({"role":"assistant","content":bot_reply,"timestamp":ts})
-                # manage memory
                 if len(self.messages) > int(self.max_messages * 0.8):
                     self._trim_messages()
 
-            # save asynchronously (best-effort)
+            # save history asynchronously (best-effort)
             try:
                 self.save_history_async()
             except Exception:
@@ -256,16 +295,15 @@ class UltraFastChatBot:
 
             return bot_reply
         except Exception:
-            # on error, still try to record user message
             try:
                 with self._lock:
                     self.messages.append({"role":"user","content":user_input,"timestamp": self._now_ts()})
                 self.save_history_async()
-            except:
+            except Exception:
                 pass
             return "Hệ thống đang bận, vui lòng thử lại sau ít phút."
 
-# Global bot
+# single global instance
 bot = UltraFastChatBot()
 
 # ---------- Routes ----------
@@ -274,7 +312,7 @@ def index():
     try:
         return render_template("sv.html")
     except Exception:
-        return "<h3>UI not found — please add templates/sv.html</h3>", 404
+        return "<h3>UI not found — please add templates/sv.html (or put a static UI in /static)</h3>", 200
 
 @app.route("/api/chat", methods=["POST"])
 def api_chat():
@@ -308,17 +346,18 @@ def api_chat():
             bot.save_history_async()
             return jsonify({"ok": True, "reply": reply})
 
-        # otherwise ask LLM (or fallback)
+        # normal LLM handling
         reply = bot.get_response_ultra_fast(message)
         return jsonify({"ok": True, "reply": reply})
     except Exception:
+        logger.exception("api_chat error")
         return jsonify({"ok": False, "error": "Server busy"}), 500
 
 @app.route("/api/history", methods=["GET"])
 def api_history():
     try:
         return jsonify({"ok": True, "messages": bot.messages[-30:]})
-    except:
+    except Exception:
         return jsonify({"ok": True, "messages": []})
 
 @app.route("/api/clear", methods=["POST"])
@@ -326,7 +365,7 @@ def api_clear():
     try:
         bot.clear_history()
         return jsonify({"ok": True, "message": "Cleared"})
-    except:
+    except Exception:
         return jsonify({"ok": False, "error": "Error"}), 500
 
 @app.route("/api/status", methods=["GET"])
@@ -334,7 +373,7 @@ def api_status():
     try:
         t = bot.get_vietnam_time_info()
         return jsonify({"ok": True, "status":"online", "messages_count": len(bot.messages), "vietnam_time": t['current_time']})
-    except:
+    except Exception:
         return jsonify({"ok": True, "status":"online"})
 
 @app.errorhandler(404)
